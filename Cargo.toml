@@ -1,0 +1,10 @@
+# ministore/Cargo.toml
+[package]
+name = "ministore"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "WAL-based embedded state store for Rust-application"
+repository = "https://github.com/ArcellaTeam/ministore/"
+
+[dependencies]
