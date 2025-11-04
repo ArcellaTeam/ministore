@@ -1,88 +1,123 @@
-# `ministore` — Архитектура
+# `ministore` — Architecture
 
-**WAL-based embedded state store для Rust-приложений**
-
----
-
-### 🎯 Цель
-
-Предоставить **минималистичное, надёжное и embeddable** хранилище для **управляющего состояния** (метаданных, конфигурации, реестров), где:
-
-- Изменения **редки**, но **критичны**.
-- Чтение должно быть **мгновенным** (из памяти).
-- Запись должна быть **устойчива к сбоям** (через `fsync`).
-- Восстановление после падения — **гарантировано**.
-
-> `ministore` — это **не база данных**, а **механизм надёжного применения мутаций к in-memory состоянию**.
+**A WAL-based embedded store for append-only logs of serializable records**
 
 ---
 
-### 🧩 Ключевые принципы
+### 🎯 Purpose
 
-1. **Простота** — < 300 строк ядра, без фоновых задач.
-2. **Надёжность** — каждая мутация сначала записывается в журнал с `fsync()`.
-3. **Generic-состояние** — работает с любым `T: Serialize + Deserialize`.
-4. **Человекочитаемый журнал** — формат JSONL по умолчанию.
-5. **Zero runtime overhead** — нет GC, компактификации, потоков.
+To provide a **minimal, reliable, and embeddable** mechanism for:
+
+1.  **Durable recording** of serializable records (mutations, events, commands) into an append-only journal.
+2.  **Replaying** the entire journal as a stream of strongly-typed records.
+
+> **`ministore` does not manage state.** It is solely responsible for **durability and replay**. The logic for applying records to in-memory state is the responsibility of the calling application.
 
 ---
 
-### 🏗️ Архитектура
+### 🧩 Core Principles
+
+1.  **Simplicity**: The core is under 150 lines of code, with no background tasks, compaction, or caching.
+2.  **Reliability**: Every record is followed by an `fsync()`, guaranteeing its persistence on disk in case of a crash.
+3.  **Type Safety**: Records are serialized and deserialized using `serde`.
+4.  **Human-Readability**: The journal is stored in the JSONL (JSON Lines) format and can be easily inspected by hand.
+5.  **Zero Runtime Overhead**: No garbage collector, background threads, or complex algorithms.
+
+---
+
+### 🏗️ Architecture
 
 ```
-┌───────────────────────┐
-│    MiniStore<T>       │
-├───────────┬───────────┤
-│ In-Memory │ Append-   │
-│ State: T  │ Only      │
-│           │ Journal   │
-└───────────┴───────────┘
+┌───────────────────────────┐
+│        Application        │
+├────────────┬──────────────┤
+│ State      │  Records     │
+│ Management │  (mutations, │
+│            │   events)    │
+└────────────┴──────────────┘
+               │
+               ▼
+┌───────────────────────────┐
+│        MiniStore          │
+├────────────┬──────────────┤
+│   append() │   replay()   │
+└────────────┴──────────────┘
+               │
+               ▼
+┌───────────────────────────┐
+│      Journal (WAL)        │
+│   (JSONL-formatted file)  │
+└───────────────────────────┘
 ```
 
-- **Журнал**: `journal.jsonl` — append-only, immutable.
-- **Состояние**: полностью хранится в памяти.
-- **Восстановление**: при старте — replay всего журнала.
+-   **Journal**: An append-only file, immutable after a record is written.
+-   **`append()`**: Appends a serialized record to the end of the journal and performs an `fsync()`.
+-   **`replay()`**: Reads the journal from disk and returns a `Vec` of deserialized records.
 
 ---
 
-### 🔁 Жизненный цикл записи
+### 📜 Journal Format
 
-1. Приложение создаёт мутацию `M`.
-2. `ministore`:
-   - Сериализует `M` → строка.
-   - Добавляет в конец `journal.jsonl`.
-   - Выполняет `fsync()`.
-   - Применяет `M` к in-memory состоянию `T`.
-3. Возвращает `Ok(())`.
+The journal is a text file in **[JSONL](http://jsonlines.org/)** format with the following structure:
 
-> 💡 Мутации **должны быть idempotent** для безопасного replay.
+```text
+// MINISTORE JOURNAL v0.1.0
+{"EventType":"UserCreated","user_id":123}
+{"EventType":"OrderPlaced","order_id":456}
+```
+
+1.  **Line 1**: A magic header that identifies the file as a `ministore` journal and specifies its version.
+2.  **Line N (N ≥ 2)**: A single JSON-serialized record from a type `R: Serialize`.
+
+This format is easy to debug and inspect using standard Unix tools (`cat`, `tail`, `jq`).
+
+---
+
+### 🔁 Guarantees
+
+| Guarantee | Description |
+| --------- | ----------- |
+| **Atomicity** | Each `append()` call writes exactly one record (one JSON line). |
+| **Durability** | After `append()` returns `Ok(())`, the record is guaranteed to be on stable storage. |
+| **Ordering** | Records returned by `replay()` are in the exact same order they were appended. |
+| **Replay Safety** | The magic header is validated on open, preventing the accidental reading of corrupted or unrelated files. |
 
 ---
 
 ### 📦 API
 
 ```rust
-impl<T> MiniStore<T> {
-    async fn open(path: &Path) -> Result<Self>;
-    async fn apply<M>(&mut self, mutation: M) -> Result<()> 
-    where M: Serialize;
-    fn state(&self) -> &T;
+impl MiniStore {
+    /// Opens (or creates) a journal at the specified path.
+    pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self>;
+
+    /// Appends a record to the journal and guarantees its durability (via fsync).
+    pub async fn append<R>(&mut self, record: &R) -> Result<()>
+    where
+        R: Serialize;
+
+    /// Replays all records from the journal at the specified path.
+    pub async fn replay<R, P: AsRef<Path>>(path: P) -> Result<Vec<R>>
+    where
+        R: DeserializeOwned;
 }
 ```
 
 ---
 
-### 🚫 Что НЕ делает `ministore`
+### 🚫 What `ministore` is NOT
 
-- Не хранит бинарные данные (сообщения, байты).
-- Не поддерживает запросы или индексы.
-- Не управляет параллелизмом (предполагается `Arc<RwLock<...>>` снаружи).
-- Не является брокером сообщений.
+-   **It is not a state manager.** You are responsible for deciding how to apply the replayed records to your application's state.
+-   **It is not thread-safe out of the box.** For shared access, wrap it in a synchronization primitive like `Arc<Mutex<MiniStore>>`.
+-   **It is not high-performance for writes.** Every `append()` performs an `fsync` — it is slow but safe.
+-   **It does not support deletion or log compaction.** This is an application-level concern (e.g., via snapshotting).
 
 ---
 
-### 🔗 Интеграции
+### 💡 Typical Use Cases
 
-`ministore` **может использоваться** как компонент в других системах, например:
-- **`walmq`** — для хранения метаданных брокера (топики, потребители, offsets).
-- **`arcella`** — для хранения реестра модулей и развёртываний.
+-   **Event Sourcing**: Storing a durable history of domain model changes.
+-   **Management Logs**: WAL for metadata, configuration, or registries.
+-   **Audit Trails**: Immutable logs of operations for security and debugging.
+
+> `ministore` is a **building block**, not a full database. It is ideal for scenarios where **simplicity and reliability** are paramount, not raw performance or complex queries.

@@ -1,2 +1,2 @@
 # ministore
-WAL-based embedded state store for Rust-application
+**A WAL-based embedded store for append-only logs of serializable records**
