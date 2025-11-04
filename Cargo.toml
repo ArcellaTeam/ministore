@@ -1,15 +1,18 @@
-# ministore/Cargo.toml
-[package]
-name = "ministore"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0 OR MIT"
-description = "WAL-based embedded state store for Rust-application"
-repository = "https://github.com/ArcellaTeam/ministore/"
+# mini-rs/Cargo.toml
+[workspace]
+resolver = "2"
+members = [
+    "ministore",
+    # "minisnap",
+    # "ministate",
+    # "miniqueue",
+]
 
-[dependencies]
+[workspace.package]
+publish = false
+
+[workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1.0", features = ["macros", "rt", "fs", "io-util"] }
-thiserror = "2.0.17"
-tempfile = "3.23.0"
+tokio = { version = "1.0", features = ["fs", "io-util"] }
+
