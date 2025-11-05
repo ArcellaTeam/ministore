@@ -140,7 +140,7 @@ pub struct StateManager<S, M> {
 
     /// Full path to the journal file (e.g., `./state/deployments.wal.jsonl`).
     journal_path: PathBuf,
-    
+
     /// Phantom marker to bind the generic mutation type `M` to this instance.
     /// Ensures type safety without storing an actual `M` value.
     _phantom: PhantomData<M>,
@@ -272,6 +272,15 @@ where
     /// - Debugging recovery issues
     pub fn journal_path(&self) -> &Path {
         &self.journal_path
+    }
+
+    /// Returns the directory where state snapshots are stored.
+    ///
+    /// Useful for:
+    /// - Backup scripts
+    /// - Debugging recovery issues
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
     }
 }
 
