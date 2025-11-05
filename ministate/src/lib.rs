@@ -9,29 +9,44 @@
 
 //! A minimal, in-memory state manager with durable WAL logging.
 //!
-//! `ministate` builds on top of [`ministore`] to provide:
-//! - **In-memory state** (`S: Default + Clone + Serialize + Deserialize`)
-//! - **Durable mutation logging** via append-only WAL
-//! - **Replay on startup** to restore state
-//! - **Logical sequence numbers** for ordering
+//! `ministate` provides a simple yet robust way to maintain **mutable application state**
+//! that survives process restarts, using an **append-only Write-Ahead Log (WAL)**.
+//! It builds directly on [`ministore`] for reliable, human-readable journaling.
 //!
-//! Optional integration with [`minisnap`] (via `snapshot` feature) enables:
-//! - Fast state recovery from snapshots
-//! - WAL compaction (truncate prefix after snapshot)
+//! ## Core Features
 //!
-//! # Design Philosophy
+//! - **In-memory state**: Fast reads via `RwLock`, full `Clone` on demand.
+//! - **Durable mutations**: Every change is first written to disk (`fsync`-ed) before being applied.
+//! - **Crash recovery**: On startup, the state is reconstructed by replaying the WAL from the beginning.
+//! - **Logical ordering**: Each mutation is assigned a monotonically increasing sequence number.
 //!
-//! - **No hidden background tasks** — everything is explicit.
-//! - **No runtime overhead** when `snapshot` feature is disabled.
-//! - **Human-readable WAL** — easy to inspect with `cat`, `jq`.
-//! - **Single-writer, multi-reader** concurrency via `RwLock`.
+//! ## Optional Snapshot Support (`snapshot` feature)
 //!
-//! # Guarantees
+//! When the `snapshot` Cargo feature is enabled, `ministate` integrates with [`minisnap`] to:
+//! - Save full state snapshots to disk for **faster recovery**.
+//! - Enable future WAL compaction (truncating the log prefix after a snapshot is taken).
 //!
-//! - **Durability**: after `apply().await` returns `Ok`, the mutation is guaranteed to be on disk.
-//! - **Atomicity**: the in-memory state is updated **only if** the WAL write succeeds.
-//! - **Ordering**: mutations are applied in the exact order they are logged.
-//! - **Recoverability**: on restart, the state is fully reconstructed by replaying the WAL.
+//! > ⚠️ Snapshotting is **explicit** — you must call `create_snapshot()` manually.
+//! > WAL compaction is not yet implemented but will be added in a future release.
+//!
+//! ## Concurrency Model
+//!
+//! - **Reads**: Concurrent via `snapshot()` (uses `RwLock::read`).
+//! - **Writes**: Serialized via `apply()` (uses `RwLock::write`).
+//! - **No hidden threads**: All I/O is explicit and `await`-driven.
+//!
+//! ## Guarantees
+//!
+//! - **Durability**: If `apply().await` returns `Ok(_)`, the mutation is guaranteed to be on disk.
+//! - **Atomicity**: The in-memory state is updated **only if** the WAL write succeeds.
+//! - **Ordering**: Mutations are applied in the exact order they appear in the WAL.
+//! - **Recoverability**: Full state restoration is possible from the WAL alone (or WAL + snapshot).
+//!
+//! ## Use Cases
+//!
+//! - Stateful services that must recover after a crash (e.g., component registries, deployment specs).
+//! - Embedded systems with limited resources but strict durability requirements.
+//! - Local coordination primitives (e.g., leader election state, queue metadata).
 //!
 //! # Example
 //!
@@ -56,7 +71,7 @@
 //!     let tmp = tempfile::tempdir()?;
 //!     let dir = tmp.path();
 //!
-//!     let mgr = StateManager::open(dir, "counter.wal").await?;
+//!     let mgr = StateManager::open(dir, "counter.wal.jsonl").await?;
 //!     mgr.apply(Inc { by: 10 }).await?;
 //!     assert_eq!(mgr.snapshot().await.value, 10);
 //!     Ok(())
@@ -65,50 +80,70 @@
 
 use ministore::MiniStore;
 use serde::{de::DeserializeOwned, Serialize};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 mod error;
 pub use error::MiniStateError;
 
 /// A mutation that can be applied to a state `S`.
 ///
-/// User-defined types implement this trait to describe how they modify state.
+/// User-defined types implement this trait to describe **how** they transform state.
+/// This is the core extension point of `ministate`.
 ///
-/// # Safety
+/// # Safety and Correctness Requirements
 ///
-/// Implementations **must be pure and deterministic**:
-/// - The same mutation applied to the same state **must always produce the same result**.
-/// - No side effects (e.g., I/O, random number generation) are allowed.
+/// Implementations **must be**:
+/// - **Pure**: No side effects (no I/O, no randomness, no time dependence).
+/// - **Deterministic**: The same mutation applied to the same state **must always**
+///   produce the identical result.
+/// - **Idempotent in context**: While the mutation itself need not be idempotent,
+///   replaying it **multiple times** during recovery must yield the same final state
+///   as applying it once (which is naturally satisfied if the above rules are followed).
+///
+/// Violating these rules can lead to **state divergence after recovery**.
 pub trait Mutator<S> {
     /// Apply this mutation to the mutable state.
     ///
-    /// This method is called **after** the mutation is durably logged to the WAL,
-    /// so it is safe to assume the mutation will survive a crash.
+    /// This method is called **after** the mutation has been successfully written
+    /// and synchronized to the WAL, so it is **safe to assume durability**.
+    ///
+    /// The implementation should be fast and free of I/O to avoid blocking the state lock.
     fn apply(&self, state: &mut S);
 }
 
 /// Manages in-memory state with durable WAL logging.
 ///
-/// On creation, replays the journal to reconstruct state.
-/// On `apply()`, logs the mutation and updates state atomically.
+/// The `StateManager` owns:
+/// - An in-memory copy of the current state (`S`), protected by `RwLock`.
+/// - A durable WAL journal (`MiniStore`) for crash recovery.
+/// - A monotonically increasing sequence number (`seq`) tracking total applied mutations.
 ///
-/// The manager is **safe to share across threads** (`Sync + Send`)
-/// and supports **concurrent reads** (via `snapshot()`)
-/// but **serializes writes** (via `RwLock` in `apply()`).
+/// It is **`Send + Sync`** and can be safely shared across tasks.
+/// Reads (`snapshot()`) are concurrent; writes (`apply()`) are serialized.
 #[derive(Debug)]
 pub struct StateManager<S, M> {
-    /// The current in-memory state, protected by a reader-writer lock.
+    /// The current in-memory state, protected by a reader-writer lock for concurrent reads.
     state: RwLock<S>,
-    /// The underlying durable WAL store.
-    store: MiniStore,
+
+    /// The underlying durable WAL store. Guarded by a `Mutex` to serialize appends.
+    store: Mutex<MiniStore>,
+
     /// Logical sequence number: total number of successfully applied mutations.
     /// Starts at 0 for an empty state, increments by 1 after each successful `apply()`.
+    /// Accessed atomically to allow lock-free reads via `sequence()`.
     seq: std::sync::atomic::AtomicU64,
-    /// Base directory for state (used for future snapshots).
+
+    /// Base directory for state (used for future snapshot storage).
     state_dir: PathBuf,
-    /// Full path to the journal file.
+
+    /// Full path to the journal file (e.g., `./state/deployments.wal.jsonl`).
     journal_path: PathBuf,
+    
+    /// Phantom marker to bind the generic mutation type `M` to this instance.
+    /// Ensures type safety without storing an actual `M` value.
+    _phantom: PhantomData<M>,
 }
 
 impl<S, M> StateManager<S, M>
@@ -118,26 +153,26 @@ where
 {
     /// Opens a state manager from a state directory and a custom journal filename.
     ///
-    /// The journal file will be located at `{state_dir}/{journal_file}`.
+    /// On first run (no journal exists), it initializes an empty state (`S::default()`).
+    /// On subsequent runs, it **replays the entire WAL** to reconstruct the latest state.
     ///
-    /// If the journal does not exist, it is created with a magic header.
-    /// If it exists, all records are replayed to reconstruct the current state.
+    /// The journal is stored at `{state_dir}/{journal_file}` and is created if missing.
     ///
     /// # Arguments
     ///
-    /// - `state_dir`: Directory to store journal (and, in the future, snapshots).
-    /// - `journal_file`: Name of the journal file (e.g., `"deployments.wal"`).
+    /// - `state_dir`: Directory to store journal (and later, snapshots). Created if missing.
+    /// - `journal_file`: Name of the WAL file (e.g., `"components.wal.jsonl"`).
     ///
     /// # Returns
     ///
-    /// A new `StateManager` with state reconstructed from the journal.
+    /// A new `StateManager` with state fully restored from the WAL.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The state directory cannot be created.
-    /// - The journal file is corrupt or contains invalid records.
-    /// - Disk I/O fails.
+    /// - The state directory cannot be created or accessed.
+    /// - The journal file exists but is corrupted or contains invalid records.
+    /// - Disk I/O fails during replay or journal opening.
     pub async fn open<P1, P2>(state_dir: P1, journal_file: P2) -> Result<Self, MiniStateError>
     where
         P1: AsRef<Path>,
@@ -161,43 +196,46 @@ where
 
         Ok(Self {
             state: RwLock::new(state),
-            store,
+            store: Mutex::new(store),
             seq,
             state_dir: state_dir.to_path_buf(),
             journal_path,
+            _phantom: PhantomData,
         })
     }
 
-    /// Applies a mutation to the state **only after** it has been durably logged.
+    /// Applies a mutation to the state **only after** it has been durably logged to the WAL.
     ///
-    /// Order of operations:
-    /// 1. Serialize and append the mutation to the WAL.
-    /// 2. `fsync` to ensure durability.
-    /// 3. **Only on success** — apply the mutation to in-memory state.
+    /// This is the **only way to modify managed state**. The operation is atomic:
+    /// - If WAL write fails → mutation is **not applied**.
+    /// - If WAL write succeeds → mutation **is applied** to in-memory state.
     ///
-    /// If WAL write fails, the mutation is **not applied** and an error is returned.
-    ///
-    /// This method **holds a write lock** on the state for its duration,
-    /// so concurrent calls will be serialized.
+    /// The method holds the **write lock** for the entire duration, so concurrent `apply()`
+    /// calls are serialized. Reads (`snapshot()`) are blocked only during the in-memory update step.
     ///
     /// # Returns
     ///
-    /// The new sequence number (1-based index of this mutation in the WAL).
+    /// The **logical sequence number** of this mutation (1-based index in the WAL).
+    /// This number is globally unique per `StateManager` instance and monotonically increasing.
     ///
     /// # Errors
     ///
-    /// Returns an error if the mutation cannot be serialized or written to disk.
+    /// Returns an error if:
+    /// - The mutation cannot be serialized (e.g., contains non-UTF8 strings).
+    /// - The underlying disk write or `fsync` fails.
     pub async fn apply(&self, mutation: M) -> Result<u64, MiniStateError> {
-        let mut state = self.state.write().await;
+        let mut state_guard = self.state.write().await;
+        let mut store_guard = self.store.lock().await;
 
-        // 1. Durable write to WAL
-        self.store.append(&mutation).await?;
+        // 1. Durable write to WAL (includes fsync)
+        store_guard.append(&mutation).await?;
 
-        // 2. Only now apply to in-memory state
-        mutation.apply(&mut state);
-
-        // 3. Increment sequence number
+        // 2. Increment sequence number atomically
         let new_seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
+        // 3. Apply mutation to in-memory state (now that durability is guaranteed)
+        mutation.apply(&mut state_guard);
+
         Ok(new_seq)
     }
 
@@ -207,7 +245,9 @@ where
     /// do not affect the managed state.
     ///
     /// This method **acquires a read lock**, so it is non-blocking for other readers
-    /// and only blocks during concurrent `apply()` calls.
+    /// and only blocks during concurrent `apply()` calls (while the write lock is held).
+    ///
+    /// **Note**: For large states, cloning may be expensive. Use judiciously.
     pub async fn snapshot(&self) -> S {
         self.state.read().await.clone()
     }
@@ -218,13 +258,18 @@ where
     ///
     /// This value is **monotonically increasing** and reflects the total number
     /// of mutations that have been durably logged and applied.
+    ///
+    /// **This is a lock-free read** (uses atomic load), so it is very cheap.
     pub fn sequence(&self) -> u64 {
         self.seq.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Returns the full path to the journal file.
     ///
-    /// Useful for backup, inspection, or external tooling.
+    /// Useful for:
+    /// - Manual inspection (`cat journal.wal.jsonl | jq`)
+    /// - Backup scripts
+    /// - Debugging recovery issues
     pub fn journal_path(&self) -> &Path {
         &self.journal_path
     }
@@ -244,19 +289,23 @@ mod snapshot_support {
     {
         /// Creates a snapshot of the current state and stores it in the state directory.
         ///
-        /// The snapshot file is named `snapshot.json` (or configurable in future versions).
+        /// The snapshot is saved as a JSON file (e.g., `snapshot.json`) and includes
+        /// the current sequence number for consistency tracking.
         ///
-        /// **Note**: This does **not** truncate the WAL. WAL compaction must be done separately.
+        /// **This does NOT truncate or compact the WAL.** Future versions will provide
+        /// a `compact()` method to safely remove WAL entries preceding the last snapshot.
         ///
-        /// Requires the `snapshot` feature.
+        /// Requires the `snapshot` Cargo feature.
         ///
         /// # Returns
         ///
-        /// `Ok(())` if the snapshot was successfully written to disk.
+        /// `Ok(())` if the snapshot was successfully serialized and written to disk.
         ///
         /// # Errors
         ///
-        /// Returns an error if the state cannot be serialized or the snapshot file cannot be written.
+        /// Returns an error if:
+        /// - The current state cannot be serialized.
+        /// - The snapshot file cannot be created or written (e.g., permission denied).
         pub async fn create_snapshot(&self) -> Result<(), MiniStateError> {
             let snap_store = SnapStore::new(&self.state_dir);
             let seq = self.sequence();

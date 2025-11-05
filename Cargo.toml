@@ -4,7 +4,7 @@ resolver = "2"
 members = [
     "ministore",
     # "minisnap",
-    # "ministate",
+    "ministate",
     # "miniqueue",
 ]
 
