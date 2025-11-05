@@ -12,7 +12,7 @@
 | Library | Purpose | Status |
 |--------|---------|--------|
 | **[`ministore`](./ministore/)** | WAL engine for durable, append-only journaling in human-readable JSONL format. | ✅ Ready |
-| **[`minisnap`](./minisnap/)** | Snapshot management and WAL compaction. | 🚧 In development |
+| **[`minisnap`](./minisnap/)** | Snapshot management and WAL compaction. | ✅ Ready |
 | **[`ministate`](./ministate/)** | Ready-to-use state manager built on `ministore`, with **optional `minisnap` support**. | ✅ Ready |
 | **[`miniqueue`](./miniqueue/)** | Simple local message queue with durability guarantees via `ministore`. | 🚧 In development |
 
