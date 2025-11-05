@@ -1,4 +1,4 @@
-// ministore/src/lib.rs
+// mini-rs/ministore/src/lib.rs
 //
 // Copyright (c) 2025 Arcella Team
 //

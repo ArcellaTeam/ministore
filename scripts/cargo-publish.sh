@@ -1,1 +1,1 @@
-cargo publish --dry-run
+cargo publish
