@@ -69,7 +69,7 @@
 //!     }
 //! }
 //!
-//! #[tokio::main]
+//! #[tokio::main(flavor = "current_thread")]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let tmp = tempfile::tempdir()?;
 //!     let path = tmp.path().join("counter.log");
@@ -159,7 +159,7 @@ impl MiniStore {
     ///
     /// ```
     /// # use ministore::MiniStore;
-    /// # #[tokio::main] async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # #[tokio::main(flavor = "current_thread")] async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let store = MiniStore::open("/tmp/myapp.log").await?;
     /// # Ok(())
     /// # }
@@ -221,7 +221,7 @@ impl MiniStore {
     /// ```
     /// # use ministore::MiniStore;
     /// # #[derive(serde::Serialize)] struct Event { id: u32 }
-    /// # #[tokio::main] async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # #[tokio::main(flavor = "current_thread")] async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut store = MiniStore::open("/tmp/events.log").await?;
     /// store.append(&Event { id: 42 }).await?;
     /// # Ok(())
@@ -262,7 +262,7 @@ impl MiniStore {
     /// ```
     /// # use ministore::MiniStore;
     /// # #[derive(serde::Deserialize, PartialEq, Debug)] struct Event { id: u32 }
-    /// # #[tokio::main] async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # #[tokio::main(flavor = "current_thread")] async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let events: Vec<Event> = MiniStore::replay("/tmp/events.log").await?;
     /// # Ok(())
     /// # }
