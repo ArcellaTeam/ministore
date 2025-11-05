@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 description = "Minimal snapshot store for durable state managers"
 keywords = ["snapshot", "state", "durability", "embedded", "wal"]
-categories = ["database-implementations", "filesystem", "no-std::no-std"]
+categories = ["database-implementations", "filesystem"]
 
 [dependencies]
 serde = { workspace = true }
