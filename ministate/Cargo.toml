@@ -1,0 +1,25 @@
+# mini-rs/ministate/Cargo.toml
+[package]
+name = "ministate"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A minimal, embeddable state manager with durable WAL logging and optional snapshot support. Ideal for component registries, metadata stores, and local state machines in edge applications."
+keywords = ["wal", "log", "durable", "embedded"]
+categories = ["database-implementations", "data-structures"]
+
+[dependencies]
+ministore = { path = "../ministore/", version = "0.1.1"}
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+thiserror = { workspace = true }
+
+[features]
+snapshot = []
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
