@@ -181,8 +181,213 @@ impl SnapStore {
         Ok((state, seq))
     }
 
+    /// Checks if a complete snapshot exists (both .json and .seq files).
+    pub async fn exists(&self) -> bool {
+        // Treat I/O errors as "not exists" to avoid panics in permission-denied scenarios.
+        fs::try_exists(&self.snapshot_path).await.unwrap_or(false)
+            && fs::try_exists(&self.metadata_path).await.unwrap_or(false)
+    }
+
     /// Returns the directory used for snapshot storage.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Deserialize};
+    use tempfile::TempDir;
+
+    #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+    struct TestState {
+        counter: u64,
+        message: String,
+    }
+
+    #[tokio::test]
+    async fn test_create_and_restore_success() {
+        let tmp = TempDir::new().unwrap();
+        let store = SnapStore::new(tmp.path());
+
+        let state = TestState {
+            counter: 100,
+            message: "hello".to_string(),
+        };
+        let seq = 42u64;
+
+        // Create a snapshot
+        store.create(&state, seq).await.unwrap();
+
+        // Restore the snapshot
+        let (restored, restored_seq) = store.restore::<TestState>().await.unwrap();
+
+        assert_eq!(restored, state);
+        assert_eq!(restored_seq, seq);
+
+        // Check that files exist
+        assert!(store.snapshot_path.exists());
+        assert!(store.metadata_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_restore_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let store = SnapStore::new(tmp.path());
+
+        let err = store.restore::<TestState>().await.unwrap_err();
+        assert!(matches!(err, MiniSnapError::Io { .. })); // Ошибка чтения файла
+    }
+
+    #[tokio::test]
+    async fn test_restore_missing_files() {
+        let tmp = TempDir::new().unwrap();
+        let store = SnapStore::new(tmp.path());
+
+        // Create only snapshot.json, but not snapshot.seq
+        fs::create_dir_all(&store.dir).await.unwrap();
+        fs::write(&store.snapshot_path, r#"{"counter":1,"message":"test"}"#)
+            .await
+            .unwrap();
+
+        let err = store.restore::<TestState>().await.unwrap_err();
+        // Must be an error when reading snapshot.seq
+        assert!(matches!(err, MiniSnapError::Io { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_restore_invalid_sequence() {
+        let tmp = TempDir::new().unwrap();
+        let store = SnapStore::new(tmp.path());
+
+        fs::create_dir_all(&store.dir).await.unwrap();
+        fs::write(&store.snapshot_path, r#"{"counter":1,"message":"test"}"#)
+            .await
+            .unwrap();
+        fs::write(&store.metadata_path, "not-a-number")
+            .await
+            .unwrap();
+
+        let err = store.restore::<TestState>().await.unwrap_err();
+        assert!(matches!(err, MiniSnapError::InvalidSequence));
+    }
+
+    #[tokio::test]
+    async fn test_restore_corrupted_json() {
+        let tmp = TempDir::new().unwrap();
+        let store = SnapStore::new(tmp.path());
+
+        fs::create_dir_all(&store.dir).await.unwrap();
+        fs::write(&store.snapshot_path, r#"{"counter": invalid json}"#)
+            .await
+            .unwrap();
+        fs::write(&store.metadata_path, "123")
+            .await
+            .unwrap();
+
+        let err = store.restore::<TestState>().await.unwrap_err();
+        assert!(matches!(err, MiniSnapError::Serde { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_create_overwrites_existing() {
+        let tmp = TempDir::new().unwrap();
+        let store = SnapStore::new(tmp.path());
+
+        let state1 = TestState {
+            counter: 1,
+            message: "first".to_string(),
+        };
+        store.create(&state1, 10).await.unwrap();
+
+        let state2 = TestState {
+            counter: 2,
+            message: "second".to_string(),
+        };
+        store.create(&state2, 20).await.unwrap();
+
+        let (restored, seq) = store.restore::<TestState>().await.unwrap();
+        assert_eq!(restored, state2);
+        assert_eq!(seq, 20);
+    }
+
+    #[tokio::test]
+    async fn test_atomicity_partial_write_does_not_corrupt() {
+        let tmp = TempDir::new().unwrap();
+        let store = SnapStore::new(tmp.path());
+
+        // Imitate partial write: create temporary files manually
+        let state_tmp = store.snapshot_path.with_extension("json.tmp");
+        let _seq_tmp = store.metadata_path.with_extension("seq.tmp");
+
+        fs::create_dir_all(&store.dir).await.unwrap();
+        fs::write(&state_tmp, r#"{"counter":999,"message":"partial"}"#)
+            .await
+            .unwrap();
+        // seq_tmp NOT created → imitation failure
+
+        // Try to restore should fail due to missing sequence file
+        let err = store.restore::<TestState>().await.unwrap_err();
+        assert!(matches!(err, MiniSnapError::Io { .. }));
+
+        // Create a correct snapshot - it should overwrite everything
+        let good_state = TestState {
+            counter: 42,
+            message: "good".to_string(),
+        };
+        store.create(&good_state, 100).await.unwrap();
+
+        let (restored, seq) = store.restore::<TestState>().await.unwrap();
+        assert_eq!(restored, good_state);
+        assert_eq!(seq, 100);
+
+        // Check that temporary files are removed
+        assert!(!state_tmp.exists());
+    }
+
+    #[tokio::test]
+    async fn test_dir_creation() {
+        let tmp = TempDir::new().unwrap();
+        let nested_dir = tmp.path().join("snapshots").join("v1");
+        let store = SnapStore::new(&nested_dir);
+
+        let state = TestState {
+            counter: 1,
+            message: "nested".to_string(),
+        };
+        store.create(&state, 1).await.unwrap();
+
+        assert!(nested_dir.exists());
+        assert!(store.snapshot_path.exists());
+        assert!(store.metadata_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_exists() {
+        let tmp = TempDir::new().unwrap();
+        let store = SnapStore::new(tmp.path());
+
+        // Initially, no files → exists() == false
+        assert!(!store.exists().await);
+
+        // Create only snapshot.json
+        fs::create_dir_all(&store.dir).await.unwrap();
+        fs::write(&store.snapshot_path, r#"{"counter":1,"message":"test"}"#)
+            .await
+            .unwrap();
+        assert!(!store.exists().await); // still false — seq missing
+
+        // Create only snapshot.seq
+        fs::remove_file(&store.snapshot_path).await.ok();
+        fs::write(&store.metadata_path, "123").await.unwrap();
+        assert!(!store.exists().await); // still false — json missing
+
+        // Create both files → exists() == true
+        fs::write(&store.snapshot_path, r#"{"counter":1,"message":"test"}"#)
+            .await
+            .unwrap();
+        assert!(store.exists().await);
+    }
+
 }
