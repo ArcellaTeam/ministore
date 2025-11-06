@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "ministate"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ministore",
  "serde",
@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "ministore"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
