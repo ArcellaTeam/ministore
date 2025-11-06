@@ -52,7 +52,7 @@
 
 use serde::{de::DeserializeOwned, Serialize};
 use std::path::{Path, PathBuf};
-use tokio::fs;
+use tokio::{fs, io::AsyncWriteExt};
 
 mod error;
 pub use error::MiniSnapError;
@@ -125,16 +125,41 @@ impl SnapStore {
 
         // Write state to temp file
         let state_tmp = self.snapshot_path.with_extension("json.tmp");
-        let state_json = serde_json::to_string_pretty(state)?;
-        fs::write(&state_tmp, state_json)
-            .await
-            .map_err(|e| MiniSnapError::Io { source: e, path: state_tmp.clone() })?;
+        {
+            let state_json = serde_json::to_string_pretty(state)?;
+
+            let mut tmp_file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(&state_tmp)
+                .await
+                .map_err(|e| MiniSnapError::Io { source: e, path: state_tmp.clone() })?;
+            tmp_file.write(state_json.as_bytes())
+                .await
+                .map_err(|e| MiniSnapError::Io { source: e, path: state_tmp.clone() })?;
+            tmp_file.sync_all()
+                .await
+                .map_err(|e| MiniSnapError::Io { source: e, path: state_tmp.clone() })?;
+        }
 
         // Write sequence to temp file
         let seq_tmp = self.metadata_path.with_extension("seq.tmp");
-        fs::write(&seq_tmp, seq.to_string())
-            .await
-            .map_err(|e| MiniSnapError::Io { source: e, path: seq_tmp.clone() })?;
+        {
+            let seq_string = seq.to_string();
+
+            let mut seq_file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(&seq_tmp)
+                .await
+                .map_err(|e| MiniSnapError::Io { source: e, path: seq_tmp.clone() })?;
+            seq_file.write(seq_string.as_bytes())
+                .await
+                .map_err(|e| MiniSnapError::Io { source: e, path: seq_tmp.clone() })?;
+            seq_file.sync_all()
+                .await
+                .map_err(|e| MiniSnapError::Io { source: e, path: seq_tmp.clone() })?;
+        }
 
         // Atomic rename
         fs::rename(&state_tmp, &self.snapshot_path)
