@@ -1,33 +1,44 @@
-# `ministate` — A Minimal State Manager with Write-Ahead Logging (WAL)
+# `ministate`
 
-**Durable, recoverable state for embedded and edge applications.**
-
-> “State is complexity. But if you must have it, let it be simple and reliable.”
+**Minimal state manager with durable WAL logging**  
+*Part of the [`mini-rs`](https://github.com/ArcellaTeam/mini-rs) embeddable toolkit*
 
 [![crates.io](https://img.shields.io/crates/v/ministate.svg)](https://crates.io/crates/ministate)  
 [![docs.rs](https://img.shields.io/docsrs/ministate)](https://docs.rs/ministate)  
 [![License: Apache-2.0/MIT](https://img.shields.io/badge/license-Apache%202.0%20%7C%20MIT-blue)](https://github.com/ArcellaTeam/mini-rs)
 
+> `ministate` gives you just enough: crash-safe, in-memory state with replayable history.
+
 ---
 
-## 📦 Installation
+## 🎯 Purpose
+
+`ministate` provides a simple yet robust way to maintain **mutable application state** that survives process restarts, using an **append-only Write-Ahead Log (WAL)** built on [`ministore`](https://crates.io/crates/ministore).
+
+Key features:
+- ✅ **In-memory state** — fast reads via `RwLock`, full `Clone` on demand.
+- ✅ **Durable mutations** — every change is `fsync`ed before being applied.
+- ✅ **Crash recovery** — full state restored by replaying WAL on startup.
+- ✅ **Logical sequencing** — each mutation gets a monotonically increasing sequence number.
+- ✅ **Optional snapshots** — enable `snapshot` feature for faster recovery (via [`minisnap`](https://crates.io/crates/minisnap)).
+
+Perfect for:
+- Component/deployment registries (e.g., in [Arcella](https://github.com/ArcellaTeam/arcella))
+- Queue metadata (e.g., in [walmq](https://github.com/ArcellaTeam/walmq))
+- Local coordination primitives (leader election, locks)
+- Embedded/IoT apps requiring crash-safe state
+
+---
+
+## 📦 Quick Start
+
+### Basic (WAL-only)
 
 ```toml
 [dependencies]
 ministate = "0.1"
+serde = { version = "1.0", features = ["derive"] }
 ```
-
-Optionally, with snapshot support:
-
-```toml
-[dependencies]
-ministate = { version = "0.1", features = ["snapshot"] }
-minisnap = "0.1"  # required separately for snapshot-based recovery
-```
-
----
-
-## 🚀 Quick Start
 
 ```rust
 use ministate::{Mutator, StateManager};
@@ -45,73 +56,58 @@ impl Mutator<Counter> for Inc {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let tmp = tempfile::tempdir()?;
-    let dir = tmp.path();
+let mgr = StateManager::open("./state", "counter.wal.jsonl").await?;
+mgr.apply(Inc { by: 10 }).await?;
+assert_eq!(mgr.snapshot().await.value, 10);
+```
 
-    // Restores state from WAL (or initializes fresh)
-    let mgr = StateManager::open(dir, "counter.wal.jsonl").await?;
+### With Snapshots (opt-in)
 
-    // Mutation — durably persisted
-    mgr.apply(Inc { by: 10 }).await?;
+```toml
+[dependencies]
+ministate = { version = "0.1", features = ["snapshot"] }
+minisnap = "0.1"
+```
 
-    // Reading — fast and concurrent
-    assert_eq!(mgr.snapshot().await.value, 10);
-
-    Ok(())
-}
+```rust
+mgr.create_snapshot().await?; // saves state + sequence number
 ```
 
 ---
 
-## ✨ Features
+## ✅ Guarantees
 
-- **Durable by default**: every mutation → `fsync` → **then** in-memory update.
-- **Full recovery**: restart → automatic WAL replay → exact prior state.
-- **Human-readable journal**: `JSONL` format — easy to inspect (`cat journal.wal.jsonl | jq`).
-- **Logical sequencing**: each mutation gets a unique, monotonically increasing sequence number (`sequence()`).
-- **Concurrency-safe**: reads (`snapshot()`) are concurrent; writes (`apply()`) are serialized.
-- **No hidden threads**: fully `async/await`—no background tasks or magic.
-
-### Optional: Snapshots (`snapshot` feature)
-
-- Save full state snapshots: `mgr.create_snapshot().await?`
-- Speed up recovery (future versions will support WAL compaction based on snapshots).
+| Guarantee       | Description |
+|-----------------|-------------|
+| **Durability**  | If `apply().await` returns `Ok`, the mutation is on disk. |
+| **Atomicity**   | In-memory state is updated **only after** WAL write succeeds. |
+| **Ordering**    | Mutations applied in exact WAL order. |
+| **Recoverability** | Full state restored from WAL (or WAL + snapshot). |
 
 ---
 
-## 🔒 Guarantees
+## 🧩 Part of `mini-rs`
 
-| Guarantee | Description |
-|---------|-------------|
-| **Durability** | If `apply().await` returns `Ok`, the data is on disk. |
-| **Atomicity** | In-memory state is updated **only after** successful WAL write. |
-| **Ordering** | Mutations are applied in the exact order recorded in the WAL. |
-| **Recoverability** | Full state can be reconstructed from the WAL (or WAL + snapshot). |
+- **`ministore`** — durable WAL engine
+- **`minisnap`** — optional snapshot & log compaction support
+- **`ministate`** — state manager (this crate)
+- **`miniqueue`** — durable message queue (in development)
 
----
-
-## 🧱 Use Cases
-
-- Component and deployment registries (e.g., in **[Arcella](https://github.com/ArcellaTeam/arcella)**)
-- Queue metadata and coordination state (e.g., in **[walmq](https://github.com/ArcellaTeam/walmq)**)
-- Local coordination primitives (leader election, locks, etc.)
-- Embedded and IoT applications requiring crash-safe state
-
----
-
-## 📚 Documentation
-
-Full API documentation is available on [docs.rs/ministate](https://docs.rs/ministate).
+Used in:
+- [**Arcella**](https://github.com/ArcellaTeam/arcella) — component and deployment state
+- [**walmq**](https://github.com/ArcellaTeam/walmq) — message queue metadata
 
 ---
 
 ## 📄 License
 
-Dual-licensed under **MIT** and **Apache-2.0** — choose the one that best fits your project.
+Dual-licensed under:
+- **Apache License 2.0**
+- **MIT License**
+
+Choose the one that best fits your project.
 
 ---
 
 > **`ministate`** — because state should be simple, durable, and recoverable.  
-> Part of the [`mini-rs`](https://github.com/ArcellaTeam/mini-rs) family.
+> Part of the [`mini-rs`](https://github.com/ArcellaTeam/mini-rs) family: simple, embeddable, reliable.

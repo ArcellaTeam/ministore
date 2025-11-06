@@ -1,14 +1,14 @@
-# mini-rs/ministore/Cargo.toml
+# mini-rs/minisnap/Cargo.toml
 [package]
-name = "ministore"
-version = "0.1.2"
+name = "minisnap"
+version = "0.1.1"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "WAL-based embedded state store for Rust-application"
-keywords = ["wal", "log", "durable", "embedded"]
-categories = ["database-implementations", "data-structures"]
+description = "Minimal snapshot store for durable state managers"
+keywords = ["snapshot", "state", "durability", "embedded", "wal"]
+categories = ["database-implementations", "filesystem"]
 
 [dependencies]
 serde = { workspace = true }
