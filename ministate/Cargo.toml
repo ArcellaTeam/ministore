@@ -11,7 +11,7 @@ keywords = ["wal", "log", "durable", "embedded"]
 categories = ["database-implementations", "data-structures"]
 
 [dependencies]
-ministore = { path = "../ministore/", version = "0.1.1"}
+ministore = "0.1.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
