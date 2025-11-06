@@ -11,14 +11,16 @@ keywords = ["wal", "log", "durable", "embedded"]
 categories = ["database-implementations", "data-structures"]
 
 [dependencies]
-ministore = "0.1.2"
+ministore = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 thiserror = { workspace = true }
 
+minisnap = { version = "0.1.1", optional = true }
+
 [features]
-snapshot = []
+snapshot = ["minisnap"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

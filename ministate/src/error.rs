@@ -9,6 +9,9 @@
 
 use ministore::MiniStoreError;
 
+#[cfg(feature = "snapshot")]
+use minisnap::MiniSnapError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum MiniStateError {
     #[error("IO error: {source}")]
@@ -22,5 +25,16 @@ pub enum MiniStateError {
         #[from]
         source: MiniStoreError
     },
+
+    #[cfg(feature = "snapshot")]
+    #[error("Snapshot error: {source}")]
+    Snapshot {
+        #[from]
+        source: MiniSnapError,
+    },
+
+    #[cfg(feature = "snapshot")]
+    #[error("Snapshot sequence number too high")]
+    SnapshotSeqTooHigh
 
 }
