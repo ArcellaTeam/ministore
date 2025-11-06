@@ -93,11 +93,12 @@
 //! }
 //! ```
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::marker::PhantomData;
 use std::path::Path;
 use tokio::{
-    fs::OpenOptions,
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+    fs::{OpenOptions, File},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter, Lines},
 };
 
 mod error;
@@ -107,12 +108,16 @@ pub use error::MiniStoreError;
 pub type Result<T> = std::result::Result<T, MiniStoreError>;
 
 /// Magic header written at the beginning of every new journal file.
+/// Full header format: "// MINISTORE JOURNAL v<semver>\n"
 ///
 /// Used to:
 /// - Identify the file as a `ministore` journal.
 /// - Validate the journal version during replay.
 /// - Prevent accidental corruption by external tools.
-const JOURNAL_MAGIC: &str = "// MINISTORE JOURNAL v0.1.0\n";
+const JOURNAL_MAGIC_CURRENT: &str = "// MINISTORE JOURNAL v0.1.3\n";
+
+/// Prefix of the magic header (without version).
+const JOURNAL_MAGIC_PREFIX: &str = "// MINISTORE JOURNAL v";
 
 /// A durable, append-only log store for serializable records.
 ///
@@ -185,7 +190,7 @@ impl MiniStore {
 
         // Initialize empty file with magic header
         if metadata.len() == 0 {
-            journal_writer.write_all(JOURNAL_MAGIC.as_bytes()).await?;
+            journal_writer.write_all(JOURNAL_MAGIC_CURRENT.as_bytes()).await?;
             journal_writer.flush().await?;
             journal_writer.get_ref().sync_all().await?;
         }
@@ -281,13 +286,7 @@ impl MiniStore {
         let mut lines = reader.lines();
 
         // Validate magic header
-        let magic = lines
-            .next_line()
-            .await?
-            .ok_or(MiniStoreError::MissingInitialState)?;
-        if magic != JOURNAL_MAGIC.trim_end() {
-            return Err(MiniStoreError::MissingInitialState);
-        }
+        validate_magic_header(&mut lines).await?;
 
         let mut records = Vec::new();
         let mut line_num = 2; // magic = line 1
@@ -307,12 +306,82 @@ impl MiniStore {
 
         Ok(records)
     }
+
+    /// Returns a stream (line iterator) over the records in the journal.
+    ///
+    /// Each line is parsed on-demand as `Result<T, MiniStoreError>`.
+    /// This avoids loading the entire journal into memory.
+    pub async fn stream<T>(path: impl AsRef<Path>) -> Result<JournalStream<T>>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let file = File::open(path).await?;
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+        validate_magic_header(&mut lines).await?;
+        Ok(JournalStream {
+            lines: lines,
+            line_number: 2, // magic = line 1, start at 2
+            _phantom: PhantomData,
+        })
+    }
+}
+
+/// Validates the magic header of a journal file.
+async fn validate_magic_header(lines: &mut Lines<BufReader<File>>) -> Result<()> {
+    // Validate magic header
+    let magic = lines
+        .next_line()
+        .await?
+        .ok_or(MiniStoreError::MissingInitialState)?;
+    if !magic.starts_with(JOURNAL_MAGIC_PREFIX) {
+        return Err(MiniStoreError::MissingInitialState);
+    }
+    Ok(())
+}
+
+pub struct JournalStream<T> {
+    lines: Lines<BufReader<File>>,
+    line_number: u64, // start at 2 (after header)
+    _phantom: PhantomData<T>,
+}
+
+impl<T> JournalStream<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    /// Asynchronously yields the next record from the journal.
+    pub async fn next(&mut self) -> Option<Result<T>> {
+        match self.lines.next_line().await {
+            Ok(Some(line)) => {
+                match serde_json::from_str(&line) {
+                    Ok(t) => {
+                        let record = Ok(t);
+                        self.line_number += 1;
+                        Some(record)
+                    }
+                    Err(e) => {
+                        let err = MiniStoreError::Deserialize {
+                            line: self.line_number as usize,
+                            source: e,
+                        };
+                        self.line_number += 1;
+                        Some(Err(err))
+                    }
+                }
+            }
+            Ok(None) => None,
+            Err(e) => Some(Err(MiniStoreError::Io { source: e})),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     enum TestMutation {
@@ -345,4 +414,73 @@ mod tests {
         let records: Vec<TestMutation> = MiniStore::replay(&path).await.unwrap();
         assert!(records.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_stream_success() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{}", JOURNAL_MAGIC_CURRENT).unwrap();
+        write!(file, "{}\n", serde_json::to_string(&TestMutation::Set { value: 10 }).unwrap()).unwrap();
+        write!(file, "{}\n", serde_json::to_string(&TestMutation::Inc { by: 5 }).unwrap()).unwrap();
+        file.flush().unwrap();
+
+        let mut stream: JournalStream<TestMutation> = MiniStore::stream(file.path()).await.unwrap();
+        let mut records: Vec<TestMutation> = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            records.push(result.unwrap());
+        }
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0], TestMutation::Set { value: 10 });
+        assert_eq!(records[1], TestMutation::Inc { by: 5 });
+    }
+
+    #[tokio::test]
+    async fn test_stream_empty_journal() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{}", JOURNAL_MAGIC_CURRENT).unwrap();
+        file.flush().unwrap();
+
+        let mut stream: JournalStream<TestMutation>  = MiniStore::stream(file.path()).await.unwrap();
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stream_missing_magic_header() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{}\n", serde_json::to_string(&TestMutation::Set { value: 1 }).unwrap()).unwrap();
+        file.flush().unwrap();
+
+        let result  = MiniStore::stream::<TestMutation>(file.path()).await;
+        assert!(matches!(result, Err(MiniStoreError::MissingInitialState)));
+    }
+
+    #[tokio::test]
+    async fn test_stream_invalid_json() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{}", JOURNAL_MAGIC_CURRENT).unwrap();
+        write!(file, "invalid json\n").unwrap();
+        file.flush().unwrap();
+
+        let mut stream: JournalStream<TestMutation> = MiniStore::stream(file.path()).await.unwrap();
+        let result = stream.next().await.unwrap();
+        assert!(result.is_err());
+        // Проверяем, что ошибка — именно десериализации
+        if let Err(MiniStoreError::Deserialize { line: 2, .. }) = result {
+            // OK
+        } else {
+            panic!("Expected Deserialize error on line 2");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_nonexistent_file() {
+        let path = tempfile::tempdir().unwrap().path().join("nonexistent.jsonl");
+        let result = MiniStore::stream::<TestMutation>(&path).await;
+        // Ожидаем ошибку I/O (файл не найден)
+        assert!(result.is_err());
+        // Точная ошибка зависит от ОС, но точно не MissingInitialState
+        assert!(!matches!(result, Err(MiniStoreError::MissingInitialState)));
+    }
+
 }
