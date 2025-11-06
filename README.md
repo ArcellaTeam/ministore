@@ -1,4 +1,4 @@
-# mini-rs — Minimalist Embedded Libraries for Rust
+# `mini-rs` — Minimalist Embedded Libraries for Rust
 
 **Reliable, lightweight, and embeddable components for building single-node fault-tolerant systems.**
 
